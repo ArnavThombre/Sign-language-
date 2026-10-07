@@ -1,0 +1,153 @@
+import cv2
+import mediapipe as mp
+import pyttsx3
+import threading
+import queue
+import math
+from collections import Counter
+
+speech_queue = queue.Queue()
+
+def tts_worker():
+    engine = pyttsx3.init()
+    while True:
+        text = speech_queue.get()
+        engine.say(text)
+        engine.runAndWait()
+        speech_queue.task_done()
+
+threading.Thread(target=tts_worker, daemon=True).start()
+
+def get_distance(p1, p2):
+    return math.hypot(p1.x - p2.x, p1.y - p2.y)
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    model_complexity=1,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.7
+)
+mp_draw = mp.solutions.drawing_utils
+
+cap = cv2.VideoCapture(0)
+
+already_spoken = False
+current_spoken_word = ""
+gesture_history = []
+
+while cap.isOpened():
+    success, img = cap.read()
+    if not success:
+        break
+
+    img = cv2.flip(img, 1)
+    imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    results = hands.process(imgRGB)
+
+    detected_gesture = ""
+    speech_text = ""
+
+    if results.multi_hand_landmarks:
+        for hand_landmarks in results.multi_hand_landmarks:
+            mp_draw.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            
+            fingers = []
+            wrist = hand_landmarks.landmark[0]
+            pinky_base = hand_landmarks.landmark[17]
+            
+            thumb_tip = hand_landmarks.landmark[4]
+            thumb_joint = hand_landmarks.landmark[3]
+            
+            if get_distance(thumb_tip, pinky_base) > get_distance(thumb_joint, pinky_base):
+                fingers.append(1)
+            else:
+                fingers.append(0)
+
+            tip_ids = [8, 12, 16, 20]
+            pip_ids = [6, 10, 14, 18]
+
+            for tip, pip in zip(tip_ids, pip_ids):
+                if get_distance(hand_landmarks.landmark[tip], wrist) > get_distance(hand_landmarks.landmark[pip], wrist):
+                    fingers.append(1)
+                else:
+                    fingers.append(0)
+
+            if fingers == [1, 1, 1, 1, 1] or fingers == [0, 1, 1, 1, 1]:
+                detected_gesture = "HELLO (OPEN PALM)"
+                speech_text = "Hello"
+            elif fingers == [1, 0, 0, 0, 0]:
+                detected_gesture = "YES (THUMBS UP)"
+                speech_text = "Yes"
+            elif fingers == [0, 1, 1, 0, 0]:
+                detected_gesture = "PEACE (V-SIGN)"
+                speech_text = "Peace"
+            elif fingers == [1, 1, 0, 0, 1]:
+                detected_gesture = "I LOVE YOU"
+                speech_text = "I Love You"
+            elif fingers == [1, 0, 0, 0, 1]:
+                detected_gesture = "CALL ME"
+                speech_text = "Call Me"
+            elif fingers == [0, 1, 0, 0, 0] or fingers == [1, 1, 0, 0, 0]: 
+                detected_gesture = "POINTING (LOOK)"
+                speech_text = "Look"
+            elif fingers == [0, 0, 1, 1, 1]:
+                detected_gesture = "OKAY"
+                speech_text = "Okay"
+            elif fingers == [0, 0, 0, 0, 0]:
+                detected_gesture = "FIST (CLOSED)"
+                speech_text = "Fist"
+
+    gesture_history.append((detected_gesture, speech_text))
+    if len(gesture_history) > 7:
+        gesture_history.pop(0)
+
+    most_common = Counter([g[0] for g in gesture_history]).most_common(1)[0][0]
+
+    if most_common != "":
+        current_speech = next((g[1] for g in gesture_history if g[0] == most_common), "")
+        
+        # --- UI UPGRADE 1: DYNAMIC TRANSPARENT BOUNDING BOX ---
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 1.2
+        font_thickness = 3
+        
+        # 1. Calculate the exact width and height of the current word
+        text_size, _ = cv2.getTextSize(most_common, font, font_scale, font_thickness)
+        text_w, text_h = text_size
+        
+        # 2. Set coordinates and padding
+        x, y = 50, 100
+        padding = 15
+        
+        # 3. Create a transparent overlay layer
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x - padding, y - text_h - padding), (x + text_w + padding, y + padding), (0, 0, 0), -1)
+        
+        # 4. Blend the black box with the live camera (0.6 = 60% opacity)
+        alpha = 0.6
+        cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+        
+        # 5. Draw the neon green text on top of the black box
+        cv2.putText(img, most_common, (x, y), font, font_scale, (0, 255, 0), font_thickness)
+        # ------------------------------------------------------
+        
+        if not already_spoken or current_spoken_word != current_speech:
+            speech_queue.put(current_speech)
+            already_spoken = True
+            current_spoken_word = current_speech
+    else:
+        already_spoken = False
+        current_spoken_word = ""
+
+    cv2.imshow("Sign Language Translator MVP", img)
+    
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+        
+    if cv2.getWindowProperty("Sign Language Translator MVP", cv2.WND_PROP_VISIBLE) < 1:
+        break
+
+cap.release()
+cv2.destroyAllWindows()

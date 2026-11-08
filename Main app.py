@@ -1,24 +1,29 @@
 import cv2
 import mediapipe as mp
-import pyttsx3
 import threading
+import queue
 import math
 import time
+import comtypes.client
 
-# --- AUDIO DEADLOCK FIX: Micro-Thread per word ---
-def speak_word(text):
-    def run_tts():
-        try:
-            import pythoncom
-            pythoncom.CoInitialize()
-        except ImportError:
-            pass
-        engine = pyttsx3.init()
-        engine.say(text)
-        engine.runAndWait()
+speech_queue = queue.Queue()
+
+def tts_worker():
+   
+    import pythoncom
+    pythoncom.CoInitialize()
     
-    # Fire and forget: spawns a fresh audio thread that dies as soon as it finishes speaking
-    threading.Thread(target=run_tts, daemon=True).start()
+    
+    speaker = comtypes.client.CreateObject("SAPI.SpVoice")
+    
+    while True:
+        text = speech_queue.get()
+        if text:
+            
+            speaker.Speak(text)
+        speech_queue.task_done()
+
+threading.Thread(target=tts_worker, daemon=True).start()
 
 def get_distance(p1, p2):
     return math.hypot(p1.x - p2.x, p1.y - p2.y)
@@ -178,8 +183,8 @@ while cap.isOpened():
         
         if confirmed_speech != "":
             if not already_spoken or current_spoken_word != confirmed_speech:
-                # --- NEW MICRO-THREAD CALL ---
-                speak_word(confirmed_speech)
+               
+                speech_queue.put(confirmed_speech)
                 already_spoken = True
                 current_spoken_word = confirmed_speech
                 

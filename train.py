@@ -1,4 +1,14 @@
 import os
+import sys
+import site
+import glob
+
+for _sp in glob.glob(os.path.expanduser(r"~\AppData\Local\Packages\PythonSoftwareFoundation.Python.*\LocalCache\local-packages\Python*\site-packages")) + [site.getusersitepackages()]:
+    if os.path.isdir(_sp):
+        if _sp in sys.path:
+            sys.path.remove(_sp)
+        sys.path.insert(0, _sp)
+
 import pickle
 import numpy as np
 import pandas as pd

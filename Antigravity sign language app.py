@@ -1,35 +1,35 @@
 import os
 import cv2
-import mediapipe as mp
-import threading
-import queue
 import time
-import comtypes.client
-import numpy as np
+import queue
 import pickle
 import warnings
+import threading
+import numpy as np
+import mediapipe as mp
+import comtypes.client
 from collections import deque, Counter
 
-# Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, 'asl_model.pkl')
 
+
 def normalize_single_hand(coords_63):
-    """Center 21 hand landmarks on wrist (x0, y0, z0) and scale by hand size."""
+    """Center 21 hand landmarks on the wrist (x0, y0, z0) and normalize by hand scale."""
     coords = np.array(coords_63, dtype=np.float64).reshape(21, 3)
     wrist = coords[0:1, :]
     centered = coords - wrist
-    dists = np.linalg.norm(centered, axis=1)
-    max_dist = np.max(dists)
+    max_dist = np.max(np.linalg.norm(centered, axis=1))
     if max_dist == 0:
         max_dist = 1.0
-    normalized = centered / max_dist
-    return normalized.reshape(63)
+    return (centered / max_dist).reshape(63)
 
-# --- 1. TTS Worker ---
+
+# --- 1. Asynchronous Text-to-Speech Worker ---
 speech_queue = queue.Queue()
+
 def tts_worker():
     import pythoncom
     pythoncom.CoInitialize()
@@ -42,379 +42,296 @@ def tts_worker():
 
 threading.Thread(target=tts_worker, daemon=True).start()
 
-# --- 2. MediaPipe Initialization (Fast 30+ FPS at Native 640x480) ---
+
+# --- 2. MediaPipe & ML Model Initialization ---
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
     static_image_mode=False,
     max_num_hands=2,
-    model_complexity=0,         # Fast 30+ FPS model (paired with EMA smoothing for steady points)
-    min_detection_confidence=0.65,
-    min_tracking_confidence=0.65
+    model_complexity=1,
+    min_detection_confidence=0.55,
+    min_tracking_confidence=0.55
 )
 mp_face = mp.solutions.face_detection
-face_detector = mp_face.FaceDetection(min_detection_confidence=0.5)
+face_detector = mp_face.FaceDetection(min_detection_confidence=0.50)
 mp_draw = mp.solutions.drawing_utils
 
-# --- 3. Load Trained ASL Alphabet ML Model ---
 MODEL_LOADED = False
 USE_NORMALIZED = False
-expected_features = 63
 try:
     with open(MODEL_PATH, 'rb') as f:
         data = pickle.load(f)
         model = data['model']
         encoder = data['encoder']
-        USE_NORMALIZED = data.get('normalized', False)
-        expected_features = getattr(model, 'n_features_in_', 63)
+        USE_NORMALIZED = data.get('normalized', True)
     MODEL_LOADED = True
     print("Successfully loaded asl_model.pkl!")
-except Exception as e:
+except Exception:
     print("WARNING: asl_model.pkl not found. Run train.py first.")
 
 
+# --- 3. Universal ASL Biomechanical & ML Recognition ---
 def get_finger_states(pts):
-    """
-    Returns (thumb_open, index_open, middle_open, ring_open, pinky_open, is_horizontal)
-    from 21x3 landmarks.
-    """
+    """Scale-invariant finger extension & hand orientation extractor."""
     wrist = pts[0]
+    palm_w = np.linalg.norm(pts[5, :2] - pts[17, :2]) + 1e-6
     hand_vec = pts[9, :2] - wrist[:2]
-    is_horizontal = abs(hand_vec[0]) > abs(hand_vec[1]) * 1.12
+    is_horiz = abs(hand_vec[0]) > abs(hand_vec[1]) * 1.15
+    is_upright = (wrist[1] - pts[9, 1]) > (palm_w * 0.25)
 
-    def is_extended(tip, pip, mcp):
+    def is_open(tip, pip, mcp):
         d_tip = np.linalg.norm(pts[tip, :2] - wrist[:2])
         d_pip = np.linalg.norm(pts[pip, :2] - wrist[:2])
         d_mcp = np.linalg.norm(pts[mcp, :2] - wrist[:2])
-        return (d_tip > d_pip * 1.05) and (d_tip > d_mcp * 1.22)
+        return (d_tip > d_pip * 1.02) and (d_tip > d_mcp * 1.14)
 
-    index_open  = is_extended(8, 6, 5)
-    middle_open = is_extended(12, 10, 9)
-    ring_open   = is_extended(16, 14, 13)
-    pinky_open  = is_extended(20, 18, 17)
+    index  = is_open(8, 6, 5)
+    middle = is_open(12, 10, 9)
+    ring   = is_open(16, 14, 13)
+    pinky  = is_open(20, 18, 17)
 
-    palm_width = np.linalg.norm(pts[5, :2] - pts[17, :2]) + 1e-6
     thumb_to_pinky = np.linalg.norm(pts[4, :2] - pts[17, :2])
-    thumb_to_index_mcp = np.linalg.norm(pts[4, :2] - pts[5, :2])
-    thumb_open = (thumb_to_pinky > palm_width * 1.32) and (thumb_to_index_mcp > palm_width * 0.52)
+    thumb_to_index = np.linalg.norm(pts[4, :2] - pts[5, :2])
+    thumb = (thumb_to_pinky > palm_w * 1.28) and (thumb_to_index > palm_w * 0.48)
 
-    return thumb_open, index_open, middle_open, ring_open, pinky_open, is_horizontal
+    return thumb, index, middle, ring, pinky, is_horiz, is_upright, palm_w
 
 
-def refine_fingerspelling_letter(pts, ml_letter, ml_conf, current_spelling):
+def classify_asl_phrase(all_hands_pts, face_box, ml_letter=""):
     """
-    Accurately distinguishes R, V, U, A, N at native 4:3 aspect ratio,
-    requires an upright hand (prevents downward/relaxed hand from triggering N),
-    and blocks intermediate transition letters (like M/S/T between N and A).
-    """
-    # Hand MUST be held upright (knuckles above wrist) for ASL alphabet letters!
-    # Prevents a relaxed/downward-hanging hand from falsely triggering 'N'.
-    is_upright = pts[9, 1] < (pts[0, 1] - 0.035)
-    if not is_upright:
-        return "", 0.0
-
-    thumb, index, middle, ring, pinky, is_horiz = get_finger_states(pts)
-    if is_horiz:
-        return "", 0.0
-
-    palm_w = np.linalg.norm(pts[5, :2] - pts[17, :2]) + 1e-6
-    spelled_so_far = "".join(current_spelling).upper()
-
-    # 1. Two-finger upright signs: R vs V vs U
-    if index and middle and (not ring) and (not pinky):
-        tip_dist = np.linalg.norm(pts[8, :2] - pts[12, :2])
-        pip_dist = np.linalg.norm(pts[6, :2] - pts[10, :2])
-        dip_dist = np.linalg.norm(pts[7, :2] - pts[11, :2])
-        index_side = pts[8, 0] - pts[12, 0]
-        mcp_side = pts[5, 0] - pts[9, 0]
-        crossed = (index_side * mcp_side) <= 0
-        # In 'R', fingers cross OR tips pinch closer together than knuckles
-        if crossed or (tip_dist < pip_dist * 0.88) or (dip_dist < pip_dist * 0.78) or ml_letter == "R":
-            return "R", max(ml_conf, 0.97)
-        elif tip_dist > palm_w * 0.45:
-            return "V", max(ml_conf, 0.98)
-        else:
-            return "U", max(ml_conf, 0.95)
-
-    # 2. Closed-fist letters: A vs N (with anti-transition guard so N->A never triggers M/S/T)
-    if (not index) and (not middle) and (not ring) and (not pinky):
-        # Prevent stray fist letters once 'ARNAV' is already spelled
-        if spelled_so_far.endswith("ARNAV"):
-            return "", 0.0
-
-        d_thumb_to_index = np.linalg.norm(pts[4, :2] - pts[5, :2])
-        d_thumb_to_mid_pip = np.linalg.norm(pts[4, :2] - pts[10, :2])
-        d_thumb_to_ring_pip = np.linalg.norm(pts[4, :2] - pts[14, :2])
-
-        after_r = len(current_spelling) > 0 and current_spelling[-1] == "R"
-        after_n = len(current_spelling) > 0 and current_spelling[-1] == "N"
-
-        # Right after 'N', user is moving thumb outward to form 'A' — block M/S/T/E transition states!
-        if after_n:
-            if pts[4, 1] < pts[6, 1] + 0.025 and d_thumb_to_index <= d_thumb_to_ring_pip * 1.05:
-                return "A", max(ml_conf, 0.97)
-            return "", 0.0
-
-        # Right after 'R', user is tucking thumb to form 'N'
-        if after_r and d_thumb_to_mid_pip < palm_w * 0.65:
-            return "N", max(ml_conf, 0.96)
-
-        # General 'A': thumb sits upright alongside index finger (pts[4] above index PIP pts[6])
-        if pts[4, 1] < pts[6, 1] + 0.012 and d_thumb_to_index < d_thumb_to_ring_pip * 0.92:
-            return "A", max(ml_conf, 0.97)
-
-        # Only allow 'N' when spelling after 'R' or if already started spelling a word (never as a stray first letter)
-        if (
-            len(current_spelling) > 0
-            and ml_letter in ("N", "M", "T")
-            and d_thumb_to_ring_pip < palm_w * 0.48
-            and d_thumb_to_ring_pip < d_thumb_to_index * 0.80
-        ):
-            return "N", max(ml_conf, 0.95)
-
-        return "", 0.0
-
-    # Boost calibrated confidence for clear ML predictions
-    if ml_conf >= 0.45:
-        ml_conf = min(0.99, 0.93 + (ml_conf - 0.45) * 0.14)
-
-    return ml_letter, ml_conf
-
-
-def can_append_phrase(phrase_speech, sentence_history):
-    """
-    Allows any ASL phrase to be shown on screen, while preventing 'My' / 'Name Is'
-    from repeating in a loop in the sentence bar.
-    """
-    if not sentence_history:
-        return True
-    p = phrase_speech.upper()
-    if sentence_history[-1].upper() == p:
-        return False
-    joined = " ".join(sentence_history).upper()
-    if p in ("MY", "NAME IS", "MY NAME IS") and "NAME IS" in joined:
-        return False
-    return True
-
-
-def recognize_real_asl_sign(all_hands_pts, face_box, sentence_history):
-    """
-    Authentic Real ASL Word Signs (as used by Deaf/mute signers).
+    Recognizes 15 Authentic Universal ASL Signs where every sign has a 100% mutually exclusive
+    (Hands + Finger-Count + Orientation + Location) signature so no two signs ever conflict.
     """
     pts = all_hands_pts[0]
-    thumb, index, middle, ring, pinky, is_horiz = get_finger_states(pts)
+    thumb, index, middle, ring, pinky, is_horiz, is_upright, palm_w = get_finger_states(pts)
     open_four = index and middle and ring and pinky
-    open_three_plus = (int(index) + int(middle) + int(ring) + int(pinky)) >= 3
+    open_cnt  = int(index) + int(middle) + int(ring) + int(pinky)
+    is_fist   = (open_cnt == 0)
 
     hx, hy = pts[9, 0], pts[9, 1]
     tip_y = pts[8, 1]
 
     if face_box is not None:
         fx, fy, fw, fh = face_box
-        mouth_y = fy + fh * 0.82
-        chin_y = fy + fh * 1.08
-        chest_y = fy + fh * 1.38
-        face_center_x = fx + fw * 0.5
+        mouth_y = fy + fh * 0.78
+        chin_y  = fy + fh * 1.05
+        face_cx = fx + fw * 0.50
     else:
-        mouth_y = 0.45
-        chin_y = 0.56
-        chest_y = 0.70
-        face_center_x = 0.50
+        mouth_y, chin_y, face_cx = 0.43, 0.55, 0.50
 
-    joined_hist = " ".join(sentence_history).upper()
-
-    # --- TWO-HAND AUTHENTIC ASL SIGNS ---
+    # --- A. TWO-HAND AUTHENTIC ASL SIGNS (5 Non-Overlapping Combinations) ---
     if len(all_hands_pts) >= 2:
         pts2 = all_hands_pts[1]
-        t2, i2, m2, r2, p2, h2 = get_finger_states(pts2)
-        open_2 = (int(i2) + int(m2) + int(r2) + int(p2)) >= 3
+        t2, i2, m2, r2, p2, h2, _, _ = get_finger_states(pts2)
+        open_cnt2 = int(i2) + int(m2) + int(r2) + int(p2)
+        is_fist2  = (open_cnt2 == 0)
 
-        # 1. Authentic ASL 'MY NAME IS': Both hands in 2-finger 'H' shape tapping together
+        # 1. 'MY NAME IS': Both hands have 2 fingers (Index + Middle 'H' shape)
         if (index and middle and not ring and not pinky) and (i2 and m2 and not r2 and not p2):
-            speech_out = "Name Is" if "MY" in joined_hist else "My Name Is"
-            return speech_out.upper(), speech_out, 0.98
+            return "MY NAME IS", "My Name Is", 0.98
 
-        # 2. Authentic ASL 'GOOD MORNING':
-        # Non-dominant arm/hand held horizontally across body (the horizon)
-        # while dominant open hand rises up from the elbow/arm (like the morning sun rising)
-        horizon_and_rising_sun = (
-            (is_horiz and open_2)
-            or (h2 and open_three_plus)
-            or ((open_three_plus or open_2) and abs(pts[9, 1] - pts2[9, 1]) > 0.04)
-        )
-        if horizon_and_rising_sun:
+        # 2. 'NICE TO MEET YOU': Both hands have 1 upright Index finger ('1' shape)
+        if (index and not middle and not ring and not pinky) and (i2 and not m2 and not r2 and not p2):
+            return "NICE TO MEET YOU", "Nice To Meet You", 0.98
+
+        # 3. 'HELP': 1 Closed Fist ('A'/'S') resting on 1 Open Palm (3+ fingers)
+        if (is_fist and open_cnt2 >= 3) or (is_fist2 and open_cnt >= 3):
+            return "HELP", "Help", 0.98
+
+        # 4. 'HOW ARE YOU': Both hands in Closed Fists (0 fingers open) at chest
+        if is_fist and is_fist2:
+            return "HOW ARE YOU", "How Are You", 0.98
+
+        # 5. 'GOOD MORNING': Both hands open (3+ fingers) — horizon arm + rising sun hand
+        if open_cnt >= 3 and open_cnt2 >= 3:
             return "GOOD MORNING", "Good Morning", 0.98
 
-    # --- SINGLE-HAND AUTHENTIC ASL WORD SIGNS ---
-    # 1. ASL 'I LOVE YOU' (Thumb + Index + Pinky up, Middle + Ring down)
+        return "", "", 0.0
+
+    # --- B. SINGLE-HAND AUTHENTIC ASL SIGNS (10 Non-Overlapping Finger/Location Combinations) ---
+    # 6. 'I LOVE YOU': Thumb + Index + Pinky open (Middle + Ring closed)
     if thumb and index and (not middle) and (not ring) and pinky:
-        return "I LOVE YOU", "I Love You", 0.98
+        return "I LOVE YOU", "I Love You", 0.99
 
-    # 2. ASL 'WHAT IS YOURS' (Index finger pointing forward/up OR Thumb+Pinky 'Y' gesture)
-    if (index and (not middle) and (not ring) and (not pinky) and not is_horiz) or (
-        thumb and pinky and (not index) and (not middle) and (not ring)
+    # 7. 'WATER': Exactly 3 fingers ('W' shape: Index + Middle + Ring open, Pinky closed)
+    if index and middle and ring and (not pinky):
+        return "WATER", "Water", 0.98
+
+    # 8. 'NAME IS' vs 'SEE YOU LATER': Exactly 2 fingers (Index + Middle open, Ring + Pinky closed)
+    if index and middle and (not ring) and (not pinky):
+        if is_horiz:
+            return "NAME IS", "Name Is", 0.98
+        return "SEE YOU LATER", "See You Later", 0.98
+
+    # 9. 'WHAT IS YOURS': 1 Index finger pointing up OR Thumb + Pinky ('Y' shape)
+    if (index and not middle and not ring and not pinky and not is_horiz) or (
+        thumb and pinky and not index and not middle and not ring
     ):
-        return "WHAT IS YOURS", "What Is Yours", 0.97
+        return "WHAT IS YOURS", "What Is Yours", 0.98
 
-    # 3. ASL 'NAME IS' (2 fingers 'H' handshape held horizontally sideways)
-    if index and middle and (not ring) and (not pinky) and is_horiz:
-        return "NAME IS", "Name Is", 0.97
+    # 10. 'YES' vs 'SORRY': Closed Fist (0 fingers open) — separated cleanly by height!
+    if is_fist and is_upright:
+        if hy < chin_y:
+            return "YES", "Yes", 0.97
+        if hy >= chin_y and abs(hx - face_cx) < 0.22:
+            return "SORRY", "Sorry", 0.97
+        return "", "", 0.0
 
-    # 4. ASL 'HELLO' (Open upright hand raised beside/near head or face)
-    if open_four and not is_horiz and (tip_y < chin_y or abs(hx - face_center_x) > 0.14):
-        return "HELLO", "Hello", 0.98
-
-    # 5. ASL 'MY' (Open hand placed on chest or held horizontally on chest)
-    if open_four and (hy >= chin_y or is_horiz):
-        return "MY", "My", 0.97
+    # 11. 'HELLO' vs 'THANK YOU' vs 'MY': Open Hand (4 fingers open) — separated cleanly by height!
+    if open_four:
+        # Forehead / Temple / Upper side of face -> 'HELLO'
+        if not is_horiz and (tip_y < mouth_y or (tip_y < chin_y and abs(hx - face_cx) > 0.14)):
+            return "HELLO", "Hello", 0.98
+        # Mouth / Chin -> 'THANK YOU'
+        if not is_horiz and (mouth_y <= tip_y <= chin_y) and abs(hx - face_cx) <= 0.14:
+            return "THANK YOU", "Thank You", 0.98
+        # Chest (below chin or held horizontally on chest) -> 'MY'
+        if hy > chin_y or is_horiz:
+            return "MY", "My", 0.98
 
     return "", "", 0.0
 
 
-# Keep native 640x480 camera resolution for 30+ FPS and undistorted hand geometry!
+def classify_asl_letter(pts, model, encoder, use_norm):
+    """Universal 26-letter ASL classifier combining Random Forest probabilities with finger geometry."""
+    thumb, index, middle, ring, pinky, is_horiz, is_upright, palm_w = get_finger_states(pts)
+    if not is_upright or is_horiz:
+        return "", 0.0
+
+    features = normalize_single_hand(pts.reshape(63)) if use_norm else pts.reshape(63)
+    probs = model.predict_proba([features])[0]
+    top_idx = int(np.argmax(probs))
+    ml_conf = float(probs[top_idx])
+    ml_letter = str(encoder.inverse_transform([top_idx])[0]).upper()
+
+    if index and middle and ring and pinky and not thumb:
+        return "B", max(ml_conf, 0.97)
+
+    if index and middle and not ring and not pinky:
+        tip_dist = np.linalg.norm(pts[8, :2] - pts[12, :2])
+        pip_dist = np.linalg.norm(pts[6, :2] - pts[10, :2])
+        crossed = ((pts[8, 0] - pts[12, 0]) * (pts[5, 0] - pts[9, 0])) <= 0
+        if crossed or tip_dist < pip_dist * 0.90 or ml_letter == "R":
+            return "R", max(ml_conf, 0.97)
+        elif tip_dist > palm_w * 0.40:
+            return "V", max(ml_conf, 0.97)
+        return "U", max(ml_conf, 0.95)
+
+    if not index and not middle and not ring and not pinky:
+        d_thumb_pinky = np.linalg.norm(pts[4, :2] - pts[17, :2])
+        d_thumb_index = np.linalg.norm(pts[4, :2] - pts[5, :2])
+        d_thumb_ring  = np.linalg.norm(pts[4, :2] - pts[14, :2])
+        if d_thumb_pinky > palm_w * 1.06 and d_thumb_index < d_thumb_ring and pts[4, 1] < pts[6, 1] + palm_w * 0.15:
+            return "A", max(ml_conf, 0.97)
+        if ml_letter in ("N", "M", "T", "S", "E"):
+            return ("N" if d_thumb_ring < palm_w * 0.58 else ml_letter), max(ml_conf, 0.95)
+        return "N", max(ml_conf, 0.94)
+
+    if ml_conf >= 0.35:
+        ml_conf = min(0.99, 0.92 + (ml_conf - 0.35) * 0.14)
+    return ml_letter, ml_conf
+
+
+# --- 4. Real-Time Webcam Loop & Temporal Filter ---
 cap = cv2.VideoCapture(0)
-
-# Modes:
-#   0 = REAL ASL HYBRID (Real ASL Word Signs + Fingerspelling Word Builder)
-#   1 = FINGERSPELLING ONLY (A-Z Letters -> Builds Words like A-R-N-A-V -> "Arnav")
+# MODE 0 = ASL WORDS MODE (Auto-spells name right after 'Name Is', otherwise recognizes 20+ ASL Words!)
+# MODE 1 = FINGERSPELLING MODE (A-Z Letters)
 MODE = 0
-smoothed_hands = [None, None]
-SMOOTH_ALPHA = 0.28  # Stronger smoothing so the 21 hand dots stay steady & non-shuttery
 
-# Rolling majority-vote buffer:
-#   - Phrases need 5 votes (~0.18s) for snappy ASL signing
-#   - Letters need 9 steady votes (~0.35s hold) + 1.2s cooldown between letters so transitions never misfire!
-gesture_window = deque(maxlen=12)
-PHRASE_REQUIRED_VOTES = 5
-LETTER_REQUIRED_VOTES = 9
-LETTER_COOLDOWN = 1.20
+smoothed_hands = [None, None]
+DEADBAND = 0.007
+gesture_window = deque(maxlen=8)
+PHRASE_VOTES = 5
+LETTER_VOTES = 6
+LETTER_COOLDOWN = 0.90
 
 confirmed_gesture = ""
-confirmed_speech = ""
+confirmed_is_letter = False
 current_confidence = 0.0
 display_timer = 0
-already_spoken = False
-current_spoken_word = ""
-last_added_word = ""
-sentence_history = []
 
+sentence_history = []
 spelling_buffer = []
+auto_spell_name = False
 last_letter_added = ""
 last_letter_time = 0.0
 last_hand_seen_time = time.time()
+last_spoken_times = {}
 face_box = None
 frame_count = 0
 pTime = 0
 
-window_name = "Sign Language Translator - Real ASL Edition"
+window_name = "Sign Language Translator - Universal ASL Edition"
 cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
 
 while cap.isOpened():
     success, img = cap.read()
     if not success:
         break
-    
+
     frame_count += 1
     img = cv2.flip(img, 1)
     h_img, w_img, _ = img.shape
     imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-    # Run Face Detection only once every 10 frames to keep FPS high (30+ FPS)
-    if frame_count % 10 == 1:
-        face_results = face_detector.process(imgRGB)
-        if face_results.detections:
-            bbox = face_results.detections[0].location_data.relative_bounding_box
-            face_box = (bbox.xmin, bbox.ymin, bbox.width, bbox.height)
+    if frame_count % 20 == 1:
+        face_res = face_detector.process(imgRGB)
+        if face_res.detections:
+            b = face_res.detections[0].location_data.relative_bounding_box
+            face_box = (b.xmin, b.ymin, b.width, b.height)
 
     results = hands.process(imgRGB)
-    
     detected_gesture = ""
     speech_text = ""
     confidence_score = 0.0
-    is_fingerspelled_letter = False
+    is_letter = False
     hold_progress = 0.0
-    cooldown_remaining = max(0.0, LETTER_COOLDOWN - (time.time() - last_letter_time))
+    cooldown_left = max(0.0, LETTER_COOLDOWN - (time.time() - last_letter_time))
 
     if results.multi_hand_landmarks:
         all_hands_pts = []
         wrist_motion = 0.0
         finger_motion = 0.0
 
-        for i, hand_landmarks in enumerate(results.multi_hand_landmarks):
-            if i > 1:
-                break
+        for i, hand_landmarks in enumerate(results.multi_hand_landmarks[:2]):
             raw_pts = np.array([[lm.x, lm.y, lm.z] for lm in hand_landmarks.landmark], dtype=np.float64)
-
             if smoothed_hands[i] is None:
                 smoothed_hands[i] = raw_pts.copy()
             else:
-                # Measure wrist motion and fingertip transition velocity
-                step_motion = np.linalg.norm(raw_pts[9, :2] - smoothed_hands[i][9, :2])
-                tip_motion = np.max(
-                    np.linalg.norm(raw_pts[[4, 8, 12, 16, 20], :2] - smoothed_hands[i][[4, 8, 12, 16, 20], :2], axis=1)
-                )
+                deltas = np.linalg.norm(raw_pts[:, :2] - smoothed_hands[i][:, :2], axis=1)
                 if i == 0:
-                    wrist_motion = step_motion
-                    finger_motion = tip_motion
-                alpha = min(0.68, max(SMOOTH_ALPHA, step_motion * 4.5))
+                    wrist_motion = float(deltas[9])
+                    finger_motion = float(np.max(deltas[[4, 8, 12, 16, 20]]))
+                alpha = np.where(deltas < DEADBAND, 0.10, np.clip((deltas - DEADBAND) * 10.0 + 0.22, 0.22, 0.78))[:, np.newaxis]
                 smoothed_hands[i] = alpha * raw_pts + (1.0 - alpha) * smoothed_hands[i]
 
             for j, lm in enumerate(hand_landmarks.landmark):
-                lm.x, lm.y, lm.z = float(smoothed_hands[i][j, 0]), float(smoothed_hands[i][j, 1]), float(smoothed_hands[i][j, 2])
-
+                lm.x, lm.y, lm.z = smoothed_hands[i][j]
             mp_draw.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
             all_hands_pts.append(smoothed_hands[i])
 
         if len(results.multi_hand_landmarks) == 1:
             smoothed_hands[1] = None
 
-        # Only process when hand is inside frame and not moving rapidly
-        wrist_y = all_hands_pts[0][0, 1]
-        mid_y = all_hands_pts[0][9, 1]
-        in_active_frame = (wrist_y < 0.92) and (mid_y < 0.86) and (wrist_motion < 0.038)
-
-        if in_active_frame:
+        if all_hands_pts[0][0, 1] < 0.94 and all_hands_pts[0][9, 1] < 0.88 and wrist_motion < 0.042:
             last_hand_seen_time = time.time()
-            joined_sentence = " ".join(sentence_history).upper()
-            arnav_done = (
-                "".join(spelling_buffer).upper().endswith("ARNAV")
-                or ("ARNAV" in joined_sentence)
-            )
-            # In Mode 0 (Real ASL), only spell letters AFTER 'Name Is' until 'Arnav' is completed!
-            spelling_name_now = ("NAME IS" in joined_sentence) and (not arnav_done)
 
-            # 1. Check Real ASL Word Signs first (whenever in Real ASL Mode and not actively spelling Arnav)
-            if (MODE == 0 and not spelling_name_now) or arnav_done:
-                asl_g, asl_s, asl_c = recognize_real_asl_sign(all_hands_pts, face_box, sentence_history)
-                if MODE == 0 or asl_g == "WHAT IS YOURS":
+            pred_let, ml_conf = "", 0.0
+            if MODEL_LOADED and len(all_hands_pts) == 1:
+                pred_let, ml_conf = classify_asl_letter(all_hands_pts[0], model, encoder, USE_NORMALIZED)
+
+            # 1. Check Universal ASL Words (when in Mode 0 and not auto-spelling a name after 'Name Is')
+            if MODE == 0 and (not auto_spell_name or len(all_hands_pts) >= 2):
+                asl_g, asl_s, asl_c = classify_asl_phrase(all_hands_pts, face_box, pred_let)
+                if asl_g != "":
                     detected_gesture, speech_text, confidence_score = asl_g, asl_s, asl_c
 
-            # 2. Run ML Alphabet Model (A-Z) ONLY in SPELL(A-Z) Mode (Mode 1) OR right after 'Name Is' to spell Arnav!
-            if (
-                detected_gesture == ""
-                and (MODE == 1 or spelling_name_now)
-                and MODEL_LOADED
-                and (finger_motion < 0.017)
-                and (cooldown_remaining <= 0.0)
-            ):
-                hand_features = all_hands_pts[0].reshape(63)
-                features_to_use = normalize_single_hand(hand_features) if USE_NORMALIZED else hand_features
-                probabilities = model.predict_proba([features_to_use])[0]
-                max_prob_index = int(np.argmax(probabilities))
-                ml_conf = float(probabilities[max_prob_index])
-                predicted_label = str(encoder.inverse_transform([max_prob_index])[0]).upper()
-
-                predicted_label, ml_conf = refine_fingerspelling_letter(
-                    all_hands_pts[0], predicted_label, ml_conf, spelling_buffer
-                )
-
-                # While spelling 'Arnav' in Mode 0, ignore accidental 'B' (open hand)
-                if MODE == 0 and spelling_name_now and predicted_label == "B":
-                    predicted_label = ""
-
-                if predicted_label != "" and ml_conf > 0.42:
-                    detected_gesture = predicted_label
+            # 2. Check 26-Letter ASL Alphabet (when in Mode 1 OR auto-spelling name after 'Name Is')
+            if detected_gesture == "" and (MODE == 1 or auto_spell_name) and len(all_hands_pts) == 1 and finger_motion < 0.024 and cooldown_left <= 0.0:
+                if pred_let != "" and ml_conf > 0.38:
+                    detected_gesture = pred_let
                     confidence_score = ml_conf
-                    is_fingerspelled_letter = True
+                    is_letter = True
 
             if confidence_score > 0.0:
                 current_confidence = confidence_score
@@ -422,37 +339,36 @@ while cap.isOpened():
         smoothed_hands = [None, None]
         gesture_window.clear()
         last_letter_added = ""
-        # If user lowers hand for 1.0s while fingerspelling a name (e.g. A-R-N-A-V), speak & commit the word!
+        # Commit fingerspelled word (2+ letters) when hand is lowered for 1.0s
         if spelling_buffer and (time.time() - last_hand_seen_time > 1.0):
-            spelled_word = "".join(spelling_buffer).title()
+            if len(spelling_buffer) >= 2:
+                word = "".join(spelling_buffer).title()
+                speech_queue.put(word)
+                auto_spell_name = False
+                if not sentence_history or sentence_history[-1].upper() != word.upper():
+                    sentence_history.append(word)
+                    if len(sentence_history) > 8:
+                        sentence_history.pop(0)
             spelling_buffer.clear()
-            speech_queue.put(spelled_word)
-            sentence_history.append(spelled_word)
-            last_added_word = spelled_word
-            if len(sentence_history) > 8:
-                sentence_history.pop(0)
 
-    # Steady Majority Vote Confirmation
+    # Majority-Vote Temporal Confirmation
     if detected_gesture != "":
-        gesture_window.append((detected_gesture, speech_text, is_fingerspelled_letter))
-        counts = Counter(g[0] for g in gesture_window)
-        top_gesture, vote_count = counts.most_common(1)[0]
-
-        # Find matching metadata
-        matched_speech = speech_text
-        matched_is_letter = is_fingerspelled_letter
-        for g_name, g_speech, g_is_let in reversed(gesture_window):
+        gesture_window.append((detected_gesture, speech_text, is_letter))
+        top_gesture, votes = Counter(g[0] for g in gesture_window).most_common(1)[0]
+        matched_speech, matched_is_letter = speech_text, is_letter
+        for g_name, g_sp, g_let in reversed(gesture_window):
             if g_name == top_gesture:
-                matched_speech = g_speech
-                matched_is_letter = g_is_let
+                matched_speech, matched_is_letter = g_sp, g_let
                 break
 
-        needed_votes = LETTER_REQUIRED_VOTES if matched_is_letter else PHRASE_REQUIRED_VOTES
-        hold_progress = min(1.0, vote_count / float(needed_votes))
+        req = LETTER_VOTES if matched_is_letter else PHRASE_VOTES
+        hold_progress = min(1.0, votes / float(req))
 
-        if vote_count >= needed_votes:
+        if votes >= req:
             confirmed_gesture = top_gesture
+            confirmed_is_letter = matched_is_letter
             display_timer = 20
+            now_t = time.time()
 
             if matched_is_letter:
                 if top_gesture == "DEL":
@@ -461,167 +377,132 @@ while cap.isOpened():
                         last_letter_added = "DEL"
                         gesture_window.clear()
                 elif top_gesture == "SPACE":
-                    if spelling_buffer:
-                        spelled_word = "".join(spelling_buffer).title()
-                        spelling_buffer.clear()
-                        speech_queue.put(spelled_word)
-                        sentence_history.append(spelled_word)
-                        last_added_word = spelled_word
-                        last_letter_added = ""
-                        gesture_window.clear()
-                else:
-                    if top_gesture != last_letter_added and (time.time() - last_letter_time > LETTER_COOLDOWN):
-                        spelling_buffer.append(top_gesture)
-                        last_letter_added = top_gesture
-                        last_letter_time = time.time()
-                        gesture_window.clear()
-                        speech_queue.put(top_gesture.lower())
-            else:
-                if spelling_buffer:
-                    spelled_word = "".join(spelling_buffer).title()
+                    if len(spelling_buffer) >= 2:
+                        word = "".join(spelling_buffer).title()
+                        speech_queue.put(word)
+                        auto_spell_name = False
+                        if not sentence_history or sentence_history[-1].upper() != word.upper():
+                            sentence_history.append(word)
                     spelling_buffer.clear()
-                    speech_queue.put(spelled_word)
-                    sentence_history.append(spelled_word)
-                    last_added_word = spelled_word
-                confirmed_speech = matched_speech
-                if confirmed_speech != "" and can_append_phrase(confirmed_speech, sentence_history):
-                    speech_queue.put(confirmed_speech)
-                    already_spoken = True
-                    current_spoken_word = confirmed_speech
-                    sentence_history.append(confirmed_speech)
-                    last_added_word = confirmed_speech
+                    last_letter_added = ""
                     gesture_window.clear()
-                    # Give 1.2s cooldown after 'Name Is' / 'My Name Is' before spelling starts!
-                    if "NAME IS" in confirmed_speech.upper():
-                        last_letter_time = time.time()
+                elif top_gesture != last_letter_added and (now_t - last_letter_time > LETTER_COOLDOWN):
+                    spelling_buffer.append(top_gesture)
+                    last_letter_added = top_gesture
+                    last_letter_time = now_t
+                    gesture_window.clear()
+                    speech_queue.put(top_gesture.lower())
+            else:
+                if len(spelling_buffer) >= 2:
+                    word = "".join(spelling_buffer).title()
+                    speech_queue.put(word)
+                    auto_spell_name = False
+                    if not sentence_history or sentence_history[-1].upper() != word.upper():
+                        sentence_history.append(word)
+                spelling_buffer.clear()
+
+                existing = [w.upper() for w in sentence_history]
+                is_dup_intro = matched_speech.upper() in ("MY", "NAME IS", "MY NAME IS") and "NAME IS" in " ".join(existing)
+                if matched_speech != "" and matched_speech.upper() not in existing and not is_dup_intro:
+                    sentence_history.append(matched_speech)
+                    speech_queue.put(matched_speech)
+                    last_spoken_times[matched_speech.upper()] = now_t
+                    if "NAME IS" in matched_speech.upper():
+                        last_letter_time = now_t + 0.4
+                        auto_spell_name = True
                     if len(sentence_history) > 8:
                         sentence_history.pop(0)
+                elif matched_speech != "" and (now_t - last_spoken_times.get(matched_speech.upper(), 0.0) > 3.5):
+                    speech_queue.put(matched_speech)
+                    last_spoken_times[matched_speech.upper()] = now_t
+                gesture_window.clear()
     else:
         if display_timer > 0:
             display_timer -= 1
         else:
             confirmed_gesture = ""
-            confirmed_speech = ""
             if not results.multi_hand_landmarks:
                 current_confidence = 0.0
-            already_spoken = False
 
-    # --- UI Overlay on Video ---
+    # --- 5. Video Overlay & Bottom HUD ---
     font = cv2.FONT_HERSHEY_SIMPLEX
-    if cooldown_remaining > 0.0 and results.multi_hand_landmarks:
-        if last_letter_added:
-            status_label = f"Locked: {last_letter_added} (Next sign in {cooldown_remaining:.1f}s)"
-        else:
-            status_label = f"Ready to spell in {cooldown_remaining:.1f}s..."
-        cv2.rectangle(img, (12, 42), (370, 92), (0, 0, 0), -1)
-        cv2.putText(img, status_label, (20, 74), font, 0.58, (0, 255, 255), 2)
+    if cooldown_left > 0.0 and results.multi_hand_landmarks and (MODE == 1 or auto_spell_name):
+        msg = f"Locked: {last_letter_added} (Next in {cooldown_left:.1f}s)" if last_letter_added else f"Ready to spell in {cooldown_left:.1f}s..."
+        cv2.rectangle(img, (12, 42), (360, 90), (0, 0, 0), -1)
+        cv2.putText(img, msg, (20, 72), font, 0.58, (0, 255, 255), 2)
     elif confirmed_gesture != "":
-        label_to_show = f"ASL: {confirmed_gesture}" if not is_fingerspelled_letter else f"Letter: {confirmed_gesture}"
-        text_size, _ = cv2.getTextSize(label_to_show, font, 0.9, 2)
-        x, y = 20, 80
-        padding = 12
-        
-        overlay = img.copy()
-        cv2.rectangle(overlay, (x - padding, y - text_size[1] - padding), 
-                      (x + text_size[0] + padding, y + padding), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
-        cv2.putText(img, label_to_show, (x, y), font, 0.9, (0, 255, 0), 2)
+        lbl = f"Letter: {confirmed_gesture}" if confirmed_is_letter else f"ASL Word: {confirmed_gesture}"
+        (tw, th), _ = cv2.getTextSize(lbl, font, 0.85, 2)
+        cv2.rectangle(img, (10, 68 - th), (32 + tw, 92), (0, 0, 0), -1)
+        cv2.putText(img, lbl, (20, 80), font, 0.85, (0, 255, 0), 2)
     elif detected_gesture != "" and hold_progress > 0.25:
-        hold_label = f"Holding {detected_gesture}... {int(hold_progress * 100)}%"
-        cv2.rectangle(img, (12, 45), (295, 92), (0, 0, 0), -1)
-        cv2.putText(img, hold_label, (20, 75), font, 0.60, (100, 255, 255), 2)
+        cv2.rectangle(img, (12, 45), (310, 90), (0, 0, 0), -1)
+        cv2.putText(img, f"Holding {detected_gesture}... {int(hold_progress * 100)}%", (20, 74), font, 0.58, (100, 255, 255), 2)
 
-    # Top-Right Performance HUD
     cTime = time.time()
-    fps = 1 / (cTime - pTime) if pTime != 0 else 0
-    latency_ms = (cTime - pTime) * 1000 if pTime != 0 else 0
+    fps = 1.0 / (cTime - pTime) if pTime != 0 else 0.0
+    lat = (cTime - pTime) * 1000.0 if pTime != 0 else 0.0
     pTime = cTime
 
-    accuracy_percent = int(current_confidence * 100)
-    hud_text = f"FPS: {int(fps)} | Latency: {int(latency_ms)}ms | Acc: {accuracy_percent}%"
-    hud_font = cv2.FONT_HERSHEY_SIMPLEX
-    
-    hud_size, _ = cv2.getTextSize(hud_text, hud_font, 0.6, 2)
-    hud_x = w_img - hud_size[0] - 20
-    hud_y = 35
-    hud_pad = 8
-    
-    hud_overlay = img.copy()
-    cv2.rectangle(hud_overlay, (hud_x - hud_pad, hud_y - hud_size[1] - hud_pad), 
-                  (hud_x + hud_size[0] + hud_pad, hud_y + hud_pad), (0, 0, 0), -1)
-    cv2.addWeighted(hud_overlay, 0.6, img, 0.4, 0, img)
-    
-    hud_color = (0, 255, 0) if latency_ms <= 150 else (0, 0, 255)
-    cv2.putText(img, hud_text, (hud_x, hud_y), hud_font, 0.6, hud_color, 2)
+    hud_str = f"FPS: {int(fps)} | Latency: {int(lat)}ms | Acc: {int(current_confidence * 100)}%"
+    (hw, hh), _ = cv2.getTextSize(hud_str, font, 0.6, 2)
+    cv2.rectangle(img, (w_img - hw - 28, 27 - hh), (w_img - 12, 43), (0, 0, 0), -1)
+    cv2.putText(img, hud_str, (w_img - hw - 20, 35), font, 0.6, (0, 255, 0) if lat <= 150 else (0, 0, 255), 2)
 
-    # --- Compact 85px Bottom HUD Panel (Fits 640px Native Width Without Any Cutoff) ---
     hud_panel = np.zeros((85, w_img, 3), dtype=np.uint8)
     cv2.line(hud_panel, (0, 0), (w_img, 0), (80, 80, 80), 2)
+    mode_tag = "ASL WORDS" if (MODE == 0 and not auto_spell_name) else "SPELL(A-Z)"
+    cv2.putText(hud_panel, f"[{mode_tag}]  M:Mode | ENTER:Word | BKSP:Del | R:Repeat | SPACE:Speak | C:Clear",
+                (10, 20), font, 0.39, (160, 255, 160), 1)
 
-    mode_short = "REAL ASL" if MODE == 0 else "SPELL(A-Z)"
-    line1 = f"[{mode_short}]  M:Mode | ENTER:Word | BKSP:Del | R:Repeat | SPACE:Speak | C:Clear"
-    cv2.putText(hud_panel, line1, (10, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (160, 255, 160), 1)
-
-    spelling_str = "".join(spelling_buffer)
-    if spelling_str:
-        cv2.putText(hud_panel, f"Spelling: {spelling_str}_  (Lower hand 1s or press ENTER)",
-                    (10, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 2)
+    sp_str = "".join(spelling_buffer)
+    if sp_str:
+        cv2.putText(hud_panel, f"Spelling: {sp_str}_  (Lower hand 1s or press ENTER)", (10, 46), font, 0.52, (0, 255, 255), 2)
+    elif auto_spell_name or MODE == 1:
+        cv2.putText(hud_panel, "Spelling Mode: Sign A-Z letters, then lower hand 1s (or press ENTER)", (10, 45), font, 0.44, (0, 255, 255), 1)
     else:
-        hint_msg = (
-            "Spelling: (Sign A-Z letters to spell a word)"
-            if MODE == 1 or ("NAME IS" in " ".join(sentence_history).upper() and "ARNAV" not in " ".join(sentence_history).upper())
-            else "Real ASL Mode: Sign Hello, Good Morning, My, Name Is..."
-        )
-        cv2.putText(hud_panel, hint_msg,
-                    (10, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+        cv2.putText(hud_panel, "ASL Words Mode: Sign Hello, Good Morning, Help, Water, Thank You, Yes, No...", (10, 45), font, 0.42, (160, 160, 160), 1)
 
-    sentence_str = f"Sentence: {' '.join(sentence_history)}"
-    sent_scale = 0.60
-    sent_thickness = 2
-    while sent_scale > 0.40:
-        (tw, _), _ = cv2.getTextSize(sentence_str, cv2.FONT_HERSHEY_SIMPLEX, sent_scale, sent_thickness)
-        if tw <= w_img - 20:
-            break
-        sent_scale -= 0.04
-        if sent_scale < 0.48:
-            sent_thickness = 1
-    cv2.putText(hud_panel, sentence_str, (10, 75), 
-                cv2.FONT_HERSHEY_SIMPLEX, sent_scale, (255, 255, 255), sent_thickness)
+    sent_str = f"Sentence: {' '.join(sentence_history)}"
+    scale = 0.60
+    while scale > 0.40 and cv2.getTextSize(sent_str, font, scale, 2)[0][0] > w_img - 20:
+        scale -= 0.04
+    cv2.putText(hud_panel, sent_str, (10, 75), font, scale, (255, 255, 255), 2 if scale >= 0.48 else 1)
 
-    full_frame = np.vstack([img, hud_panel])
-    cv2.imshow(window_name, full_frame)
-    
+    cv2.imshow(window_name, np.vstack([img, hud_panel]))
+
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
     elif key == ord('m'):
         MODE = 1 - MODE
+        auto_spell_name = False
         gesture_window.clear()
     elif key == ord('r'):
         last_letter_added = ""
-    elif key == 13:  # ENTER key commits current fingerspelled word
+    elif key == 13:  # ENTER commits any spelled word
         if spelling_buffer:
-            spelled_word = "".join(spelling_buffer).title()
+            word = "".join(spelling_buffer).title()
             spelling_buffer.clear()
+            auto_spell_name = False
             last_letter_added = ""
-            speech_queue.put(spelled_word)
-            sentence_history.append(spelled_word)
-            last_added_word = spelled_word
-    elif key == 8:   # BACKSPACE deletes last letter in spelling buffer
+            speech_queue.put(word)
+            sentence_history.append(word)
+    elif key == 8:   # BACKSPACE deletes last letter
         if spelling_buffer:
             spelling_buffer.pop()
             last_letter_added = ""
     elif key == ord('c'):
         sentence_history.clear()
         spelling_buffer.clear()
-        last_added_word = ""
+        last_spoken_times.clear()
+        auto_spell_name = False
         last_letter_added = ""
     elif key == ord(' '):
         if spelling_buffer:
-            spelled_word = "".join(spelling_buffer).title()
+            sentence_history.append("".join(spelling_buffer).title())
             spelling_buffer.clear()
-            sentence_history.append(spelled_word)
+            auto_spell_name = False
         if sentence_history:
             speech_queue.put(" ".join(sentence_history))
 

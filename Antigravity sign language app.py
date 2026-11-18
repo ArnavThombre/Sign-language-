@@ -1,4 +1,15 @@
 import os
+import sys
+import site
+import glob
+
+# Ensure working mediapipe (0.10.21 with mp.solutions) from user site-packages takes priority over broken venv mediapipe
+for _sp in glob.glob(os.path.expanduser(r"~\AppData\Local\Packages\PythonSoftwareFoundation.Python.*\LocalCache\local-packages\Python*\site-packages")) + [site.getusersitepackages()]:
+    if os.path.isdir(_sp):
+        if _sp in sys.path:
+            sys.path.remove(_sp)
+        sys.path.insert(0, _sp)
+
 import cv2
 import time
 import queue
@@ -412,9 +423,6 @@ while cap.isOpened():
                         auto_spell_name = True
                     if len(sentence_history) > 8:
                         sentence_history.pop(0)
-                elif matched_speech != "" and (now_t - last_spoken_times.get(matched_speech.upper(), 0.0) > 3.5):
-                    speech_queue.put(matched_speech)
-                    last_spoken_times[matched_speech.upper()] = now_t
                 gesture_window.clear()
     else:
         if display_timer > 0:
